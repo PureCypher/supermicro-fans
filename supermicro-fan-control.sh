@@ -11,6 +11,12 @@
 
 set -euo pipefail
 
+# Require bash 4.3+ for associative array namerefs (local -n)
+if (( BASH_VERSINFO[0] < 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] < 3) )); then
+    echo "ERROR: bash 4.3 or later required (found ${BASH_VERSION})" >&2
+    exit 1
+fi
+
 ################################################################################
 # CONFIGURATION
 ################################################################################
@@ -34,11 +40,12 @@ POLL_INTERVAL=10
 # Set to 95°C (well below the 102°C high critical threshold for safety margin)
 EMERGENCY_TEMP=95
 
-# Fan curve: temperature -> duty cycle percentage
-# Applied to both Zone 0 (CPU fans) and Zone 1 (Peripheral fans)
-# Since fans are physically next to each other, use the same curve for both
+# Per-zone fan curves: temperature -> duty cycle percentage
+# Both zones use CPU temperature as input, but can respond at different levels
 # CPU safe operating range: 10-97°C (based on sensor thresholds)
-declare -A FAN_CURVE=(
+
+# Zone 0 (CPU fans: FAN1, FAN2, etc.)
+declare -A CPU_FAN_CURVE=(
     [0]=15      # Below 35°C: 15%
     [35]=15     # 35-40°C: 15%
     [40]=15     # 40-45°C: 15%
@@ -54,6 +61,29 @@ declare -A FAN_CURVE=(
     [90]=100    # Above 90°C: 100%
 )
 
+# Zone 1 (Peripheral/system fans: FANA, FANB, etc.)
+# Less aggressive than CPU fans by default to reduce case fan noise
+declare -A SYS_FAN_CURVE=(
+    [0]=15      # Below 35°C: 15%
+    [35]=15     # 35-40°C: 15%
+    [40]=15     # 40-45°C: 15%
+    [45]=15     # 45-50°C: 15%
+    [50]=15     # 50-55°C: 15%
+    [55]=15     # 55-60°C: 15%
+    [60]=15     # 60-65°C: 15%
+    [65]=15     # 65-70°C: 15%
+    [70]=45     # 70-75°C: 45%
+    [75]=60     # 75-80°C: 60%
+    [80]=75     # 80-85°C: 75%
+    [85]=90     # 85-90°C: 90%
+    [90]=100    # Above 90°C: 100%
+)
+
+# Backwards compatibility: if the legacy FAN_CURVE is defined (e.g. from an
+# older version of this script), it overrides both per-zone curves above.
+# To use per-zone curves, remove or comment out any FAN_CURVE definition.
+# declare -A FAN_CURVE=(...)
+
 # IPMI commands
 IPMI_ENABLE_MANUAL="0x30 0x45 0x01 0x01"
 IPMI_SET_FAN_ZONE="0x30 0x70 0x66 0x01"
@@ -68,6 +98,15 @@ CURRENT_CPU_DUTY=0
 CURRENT_PERIPHERAL_DUTY=0
 LAST_TEMP=0
 MANUAL_MODE_ACTIVE=false
+
+# Apply legacy FAN_CURVE if defined (backwards compatibility)
+if declare -p FAN_CURVE &>/dev/null; then
+    for _key in "${!FAN_CURVE[@]}"; do
+        CPU_FAN_CURVE[$_key]=${FAN_CURVE[$_key]}
+        SYS_FAN_CURVE[$_key]=${FAN_CURVE[$_key]}
+    done
+    unset _key
+fi
 
 ################################################################################
 # UTILITY FUNCTIONS
@@ -132,16 +171,19 @@ get_max_temp() {
     echo "${max_temp}"
 }
 
-# Calculate fan duty based on temperature using the fan curve
-# Used for both CPU and peripheral fans since they're physically adjacent
+# Calculate fan duty based on temperature using the specified fan curve
+# Pass the curve name (CPU_FAN_CURVE or SYS_FAN_CURVE) as second argument
 calculate_fan_duty() {
     local temp=$1
+    local -n _curve=$2
     local duty=15  # Default minimum
 
-    # Find appropriate duty cycle from fan curve
-    for threshold in $(echo "${!FAN_CURVE[@]}" | tr ' ' '\n' | sort -n); do
+    # Find appropriate duty cycle from fan curve (sorted thresholds)
+    local -a _sorted_keys
+    mapfile -t _sorted_keys < <(printf '%s\n' "${!_curve[@]}" | sort -n)
+    for threshold in "${_sorted_keys[@]}"; do
         if [[ ${temp} -ge ${threshold} ]]; then
-            duty=${FAN_CURVE[${threshold}]}
+            duty=${_curve[${threshold}]}
         fi
     done
 
@@ -172,7 +214,7 @@ enable_auto_mode() {
 
     # If that fails, set fans to 100% as a safety measure
     log "WARN" "Could not restore auto mode, setting fans to 100% for safety"
-    set_fan_duty 100
+    set_all_fans_duty 100
     return 1
 }
 
@@ -240,7 +282,7 @@ cleanup() {
 
     if ${MANUAL_MODE_ACTIVE}; then
         log "INFO" "Restoring automatic fan control mode"
-        enable_auto_mode
+        enable_auto_mode || true
     fi
 
     log "INFO" "Fan control script stopped"
@@ -318,7 +360,18 @@ preflight_checks() {
 
 main_loop() {
     log "INFO" "Starting main control loop (polling every ${POLL_INTERVAL} seconds)"
-    log "INFO" "Controlling Zone 0 (CPU fans) and Zone 1 (Peripheral fans) independently"
+    log "INFO" "Controlling Zone 0 (CPU fans) and Zone 1 (Peripheral fans) with per-zone curves"
+
+    # Log active fan curves at startup
+    local cpu_curve_str="" sys_curve_str=""
+    for _t in $(echo "${!CPU_FAN_CURVE[@]}" | tr ' ' '\n' | sort -n); do
+        cpu_curve_str+="${_t}°C:${CPU_FAN_CURVE[$_t]}% "
+    done
+    for _t in $(echo "${!SYS_FAN_CURVE[@]}" | tr ' ' '\n' | sort -n); do
+        sys_curve_str+="${_t}°C:${SYS_FAN_CURVE[$_t]}% "
+    done
+    log "INFO" "Zone 0 (CPU) curve: ${cpu_curve_str}"
+    log "INFO" "Zone 1 (Peripheral) curve: ${sys_curve_str}"
 
     while true; do
         # Get current maximum temperature
@@ -337,38 +390,39 @@ main_loop() {
             handle_emergency "${current_temp}"
         fi
 
-        # Calculate required fan duty (same for both zones)
-        local target_duty
-        target_duty=$(calculate_fan_duty "${current_temp}")
+        # Calculate per-zone target duties from their respective curves
+        local cpu_target sys_target
+        cpu_target=$(calculate_fan_duty "${current_temp}" CPU_FAN_CURVE)
+        sys_target=$(calculate_fan_duty "${current_temp}" SYS_FAN_CURVE)
 
-        # Track if any changes were made
         local changes_made=false
 
-        # Update both zones if needed (they use the same target duty)
-        if [[ ${target_duty} -ne ${CURRENT_CPU_DUTY} ]] || [[ ${target_duty} -ne ${CURRENT_PERIPHERAL_DUTY} ]]; then
-            log "INFO" "Temperature: ${current_temp}°C | Setting both zones: ${target_duty}%"
-
-            # Update Zone 0 (CPU fans)
-            if ! set_fan_duty_zone 0 "${target_duty}"; then
+        # Update Zone 0 (CPU fans) if duty has changed
+        if [[ ${cpu_target} -ne ${CURRENT_CPU_DUTY} ]]; then
+            log "INFO" "Temperature: ${current_temp}°C | Zone 0 (CPU): ${CURRENT_CPU_DUTY}% -> ${cpu_target}%"
+            if ! set_fan_duty_zone 0 "${cpu_target}"; then
                 log "ERROR" "Failed to set CPU fan duty - reverting to auto mode for safety"
                 enable_auto_mode
                 exit 1
             fi
+            changes_made=true
+        fi
 
-            # Update Zone 1 (Peripheral fans)
-            if ! set_fan_duty_zone 1 "${target_duty}"; then
+        # Update Zone 1 (Peripheral fans) if duty has changed
+        if [[ ${sys_target} -ne ${CURRENT_PERIPHERAL_DUTY} ]]; then
+            log "INFO" "Temperature: ${current_temp}°C | Zone 1 (Peripheral): ${CURRENT_PERIPHERAL_DUTY}% -> ${sys_target}%"
+            if ! set_fan_duty_zone 1 "${sys_target}"; then
                 log "ERROR" "Failed to set Peripheral fan duty - reverting to auto mode for safety"
                 enable_auto_mode
                 exit 1
             fi
-
             changes_made=true
         fi
 
-        # Log status if no changes (only every 6 cycles to reduce spam)
+        # Periodic stable status log (roughly every 60 seconds)
         if ! ${changes_made}; then
             if [[ $(($(date +%s) % 60)) -lt ${POLL_INTERVAL} ]]; then
-                log "INFO" "Temperature: ${current_temp}°C | Both zones: ${target_duty}% (stable)"
+                log "INFO" "Temperature: ${current_temp}°C | Zone 0 (CPU): ${cpu_target}% | Zone 1 (Peripheral): ${sys_target}% (stable)"
             fi
         fi
 
