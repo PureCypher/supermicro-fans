@@ -6,7 +6,7 @@ A smart, automated fan control script for Supermicro servers with IPMI support. 
 
 - **Ultra-Quiet Operation**: Maintains 15% fan speed for normal temperatures (below 70°C)
 - **Temperature-Based Control**: Automatically adjusts fan speeds based on CPU temperature
-- **Dual-Zone Management**: Controls both CPU fans (Zone 0) and peripheral fans (Zone 1) independently
+- **Per-Zone Fan Curves**: Independent fan curves for CPU fans (Zone 0) and peripheral fans (Zone 1)
 - **Safety First**: Multiple safety mechanisms including emergency thresholds and automatic failover
 - **Systemd Integration**: Runs as a service with automatic startup
 - **Detailed Logging**: Comprehensive logs with automatic rotation
@@ -20,7 +20,7 @@ A smart, automated fan control script for Supermicro servers with IPMI support. 
 ## Software Requirements
 
 - `ipmitool` - IPMI management utility
-- `bash` - Shell scripting environment
+- `bash` 4.3 or later - Shell scripting environment
 - Root/sudo access
 
 ## Quick Start
@@ -76,31 +76,48 @@ sudo tail -f /var/log/fan-control.log
 
 ## Fan Curve Configuration
 
-### Current Default: Ultra-Quiet Profile
+The script supports **per-zone fan curves**, allowing independent speed profiles for CPU fans and peripheral/case fans. Both zones are driven by CPU temperature, but each can respond at different duty cycle levels.
 
-The script uses an ultra-quiet fan curve optimized for home/office environments:
+This is useful when case fans (Zone 1) are louder than CPU fans (Zone 0) and you want them to run at lower RPMs.
+
+### Default Curves
+
+**Zone 0 -- CPU fans (`CPU_FAN_CURVE`):**
 
 | Temperature Range | Fan Speed | Notes |
 |-------------------|-----------|-------|
-| < 70°C            | 15%       | Almost silent - normal operation |
+| < 70°C            | 15%       | Almost silent, normal operation |
 | 70-75°C           | 60%       | High load cooling |
 | 75-80°C           | 70%       | Very high load |
 | 80-85°C           | 80%       | Near emergency threshold |
 | 85-90°C           | 90%       | Critical temperatures |
-| ≥ 90°C            | 100%      | Maximum cooling |
+| >= 90°C           | 100%      | Maximum cooling |
 
-**Emergency Threshold**: 95°C (triggers 100% fan speed and safety shutdown)
+**Zone 1 -- Peripheral fans (`SYS_FAN_CURVE`):**
 
-### Customizing the Fan Curve
+| Temperature Range | Fan Speed | Notes |
+|-------------------|-----------|-------|
+| < 70°C            | 15%       | Almost silent, normal operation |
+| 70-75°C           | 45%       | Moderate cooling (quieter than CPU zone) |
+| 75-80°C           | 60%       | High load |
+| 80-85°C           | 75%       | Near emergency threshold |
+| 85-90°C           | 90%       | Critical temperatures |
+| >= 90°C           | 100%      | Maximum cooling |
 
-Edit the `FAN_CURVE` array in [supermicro-fan-control.sh](supermicro-fan-control.sh) (lines 41-55):
+**Emergency Threshold**: 95°C (triggers 100% fan speed on both zones and safety shutdown)
 
-#### Alternative: Balanced Profile
+> **Note:** Both zones use CPU temperature as their input. Supermicro X10/X11 boards do not expose per-zone temperature sensors through IPMI in a way that maps cleanly to peripheral devices, so CPU temperature drives both curves.
 
-For more gradual temperature response:
+### Customising the Fan Curves
+
+Edit `CPU_FAN_CURVE` and `SYS_FAN_CURVE` in [supermicro-fan-control.sh](supermicro-fan-control.sh):
+
+#### Example: Quieter Case Fans
+
+Keep CPU fans responsive while running case fans at minimal speed until temperatures are high:
 
 ```bash
-declare -A FAN_CURVE=(
+declare -A CPU_FAN_CURVE=(
     [0]=15      # Below 40°C: 15%
     [40]=20     # 40-50°C: 20%
     [50]=30     # 50-60°C: 30%
@@ -110,14 +127,33 @@ declare -A FAN_CURVE=(
     [80]=90     # 80-85°C: 90%
     [85]=100    # Above 85°C: 100%
 )
+
+declare -A SYS_FAN_CURVE=(
+    [0]=15      # Below 60°C: 15%
+    [60]=15     # 60-70°C: 15%
+    [70]=25     # 70-75°C: 25%
+    [75]=40     # 75-80°C: 40%
+    [80]=60     # 80-85°C: 60%
+    [85]=100    # Above 85°C: 100%
+)
 ```
 
-#### Alternative: Performance Profile
+#### Example: Performance Profile
 
-For maximum cooling and lower temperatures:
+For maximum cooling across both zones:
 
 ```bash
-declare -A FAN_CURVE=(
+declare -A CPU_FAN_CURVE=(
+    [0]=25      # Below 35°C: 25%
+    [35]=30     # 35-45°C: 30%
+    [45]=40     # 45-55°C: 40%
+    [55]=55     # 55-65°C: 55%
+    [65]=70     # 65-75°C: 70%
+    [75]=85     # 75-80°C: 85%
+    [80]=100    # Above 80°C: 100%
+)
+
+declare -A SYS_FAN_CURVE=(
     [0]=25      # Below 35°C: 25%
     [35]=30     # 35-45°C: 30%
     [45]=40     # 45-55°C: 40%
@@ -128,7 +164,14 @@ declare -A FAN_CURVE=(
 )
 ```
 
-After modifying the fan curve:
+### Backwards Compatibility
+
+If you are upgrading from a version that used a single `FAN_CURVE` variable, you have two options:
+
+1. **Migrate** (recommended): Copy your `FAN_CURVE` values to `CPU_FAN_CURVE`, then create a less aggressive `SYS_FAN_CURVE` for your case fans.
+2. **Keep the old variable**: If `FAN_CURVE` is defined in the script, it automatically overrides both `CPU_FAN_CURVE` and `SYS_FAN_CURVE`, so existing deployments continue to work without changes.
+
+After modifying the fan curves:
 
 ```bash
 sudo systemctl restart supermicro-fan-control.service
@@ -147,13 +190,15 @@ Edit [supermicro-fan-control.sh](supermicro-fan-control.sh) to customize:
 | `FAN_ZONES` | `(0 1)` | Fan zones to control |
 | `POLL_INTERVAL` | `10` | Temperature check interval (seconds) |
 | `EMERGENCY_TEMP` | `95` | Emergency shutdown temperature (°C) |
+| `CPU_FAN_CURVE` | Ultra-quiet profile | Fan curve for Zone 0 (CPU fans) |
+| `SYS_FAN_CURVE` | Quieter than CPU curve | Fan curve for Zone 1 (peripheral fans) |
 
 ## Safety Features
 
 1. **Emergency Threshold Protection**: If temps exceed 95°C, fans go to 100% and script exits to auto mode
-2. **Sensor Failure Protection**: If sensors fail to read, fans go to 100% and revert to auto mode
+2. **Sensor Failure Protection**: If sensors fail to read, fans revert to automatic BMC control (and set to 100% if auto mode restoration also fails)
 3. **Service Stop Safety**: When service stops, automatic fan control is restored
-4. **Dual-Zone Redundancy**: Both zones controlled independently for reliability
+4. **Per-Zone Safety**: Both zones enforce minimum speed and emergency thresholds independently
 5. **Conservative Design**: 15% minimum fan speed ensures adequate airflow at all times
 6. **Log Rotation**: Automatic log rotation prevents disk space issues
 
@@ -189,10 +234,14 @@ watch -n 2 'ipmitool sensor | grep -E "(Temp|FAN)"'
 
 ```
 [2025-11-12 10:30:00] [INFO] Starting main control loop (polling every 10 seconds)
-[2025-11-12 10:30:00] [INFO] Controlling Zone 0 (CPU fans) and Zone 1 (Peripheral fans) independently
-[2025-11-12 10:30:00] [INFO] Temperature: 45°C | Setting both zones: 15%
-[2025-11-12 10:31:00] [INFO] Temperature: 45°C | Both zones: 15% (stable)
-[2025-11-12 10:35:00] [INFO] Temperature: 72°C | Setting both zones: 60%
+[2025-11-12 10:30:00] [INFO] Controlling Zone 0 (CPU fans) and Zone 1 (Peripheral fans) with per-zone curves
+[2025-11-12 10:30:00] [INFO] Zone 0 (CPU) curve: 0°C:15% 35°C:15% ... 90°C:100%
+[2025-11-12 10:30:00] [INFO] Zone 1 (Peripheral) curve: 0°C:15% 35°C:15% ... 90°C:100%
+[2025-11-12 10:30:00] [INFO] Temperature: 45°C | Zone 0 (CPU): 0% -> 15%
+[2025-11-12 10:30:00] [INFO] Temperature: 45°C | Zone 1 (Peripheral): 0% -> 15%
+[2025-11-12 10:31:00] [INFO] Temperature: 45°C | Zone 0 (CPU): 15% | Zone 1 (Peripheral): 15% (stable)
+[2025-11-12 10:35:00] [INFO] Temperature: 72°C | Zone 0 (CPU): 15% -> 60%
+[2025-11-12 10:35:00] [INFO] Temperature: 72°C | Zone 1 (Peripheral): 15% -> 45%
 ```
 
 ## Manual IPMI Control
@@ -294,16 +343,16 @@ Common causes:
 
 ## Expected Noise Levels
 
-With the ultra-quiet default configuration:
+With the ultra-quiet default configuration (Zone 1 runs at lower duty than Zone 0 between 70-85°C):
 
-| Fan Speed | Noise Level | When It Occurs |
-|-----------|-------------|----------------|
-| 15% | Almost silent | Normal operation (< 70°C) |
-| 60% | Very loud | High load (70-75°C) |
-| 70% | Very loud | Very high load (75-80°C) |
-| 80% | Extremely loud | Near emergency (80-85°C) |
-| 90% | Extremely loud | Critical (85-90°C) |
-| 100% | Maximum | Emergency (≥ 90°C) |
+| Temperature | Zone 0 (CPU) | Zone 1 (Peripheral) | Noise Level |
+|-------------|-------------|---------------------|-------------|
+| < 70°C      | 15%         | 15%                 | Almost silent |
+| 70-75°C     | 60%         | 45%                 | Loud (CPU fans ramp first) |
+| 75-80°C     | 70%         | 60%                 | Very loud |
+| 80-85°C     | 80%         | 75%                 | Extremely loud |
+| 85-90°C     | 90%         | 90%                 | Extremely loud |
+| >= 90°C     | 100%        | 100%                | Maximum |
 
 ## Uninstalling
 
@@ -328,8 +377,8 @@ sudo ipmitool raw 0x30 0x01 0x01
 
 1. **Initialization**: Script enables manual fan control mode via IPMI
 2. **Monitoring**: Every 10 seconds (configurable), reads CPU temperatures from both CPUs
-3. **Calculation**: Uses the maximum temperature to determine required fan speed from the fan curve
-4. **Control**: Sends IPMI commands to set both fan zones to the calculated speed
+3. **Calculation**: Uses the maximum temperature to look up each zone's target duty from its fan curve
+4. **Control**: Sends IPMI commands to set each fan zone to its independently calculated speed
 5. **Safety**: Continuously monitors for emergency conditions and sensor failures
 6. **Cleanup**: On exit, returns fans to automatic IPMI control mode
 
@@ -337,7 +386,7 @@ sudo ipmitool raw 0x30 0x01 0x01
 
 - **Zone 0**: CPU fans (directly cooling processors)
 - **Zone 1**: Peripheral/System fans (case airflow)
-- **Control Strategy**: Both zones use the same fan curve for consistent airflow and noise levels
+- **Control Strategy**: Each zone uses its own fan curve; CPU fans can ramp independently of peripheral fans
 - **Temperature Source**: Maximum temperature from CPU1 and CPU2 sensors
 
 ## Contributing
